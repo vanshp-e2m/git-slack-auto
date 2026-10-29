@@ -1,17 +1,17 @@
-name: Slack commit notifications
+name: Slack PR merge notifications
 
-# Only these two branches notify. Pushes to test-1, test-2, main, etc. are ignored.
-# A merged PR updates the base branch with a push, so PR merges are covered too.
+# Notify only when a PR is MERGED into dev-connect or dev-command.
+# Individual commits/pushes, other branches, and PRs closed without merging are ignored.
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches:
       - dev-connect
       - dev-command
 
 jobs:
   notify:
-    # Skip branch deletions (nothing to report).
-    if: github.event.deleted == false
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,84 +29,79 @@ jobs:
               return;
             }
 
-            const { payload } = context;
+            const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
-            const branch = context.ref.replace('refs/heads/', '');
-            const head = payload.head_commit;
-            const commits = payload.commits || [];
-            const repoUrl = payload.repository.html_url;
+            const base = pr.base.ref;
+            const repoUrl = context.payload.repository.html_url;
+            const product = { 'dev-connect': 'WordPress plugin', 'dev-command': 'Claude plugin' }[base] || base;
 
             // Slack mrkdwn needs &, <, > escaped.
             const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
             const firstLine = (s) => String(s || '').split('\n')[0];
             const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+            const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
-            // Was this push the result of merging a PR into this branch?
-            let pr = null;
+            let commits = [];
             try {
-              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: head.id });
-              pr = data.find((p) => p.merged_at && p.base.ref === branch) || null;
+              commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
             } catch (e) {
-              core.warning(`PR lookup failed: ${e.message}`);
+              core.warning(`Commit lookup failed: ${e.message}`);
             }
 
-            // Diff stats for the whole push (or just the head commit for a brand-new branch).
-            let files = 0, additions = 0, deletions = 0;
-            try {
-              if (/^0+$/.test(payload.before)) {
-                const { data } = await github.rest.repos.getCommit({ owner, repo, ref: head.id });
-                files = data.files.length; additions = data.stats.additions; deletions = data.stats.deletions;
-              } else {
-                const { data } = await github.rest.repos.compareCommits({ owner, repo, base: payload.before, head: payload.after });
-                files = data.files.length;
-                for (const f of data.files) { additions += f.additions; deletions += f.deletions; }
-              }
-            } catch (e) {
-              core.warning(`Diff stats lookup failed: ${e.message}`);
-            }
+            const mergeSha = pr.merge_commit_sha;
+            const mergeUrl = `${repoUrl}/commit/${mergeSha}`;
+            const last = commits[commits.length - 1];
 
-            const count = commits.length || 1;
-            const heading = pr
-              ? `🔀 PR #${pr.number} merged into ${branch}: ${pr.title}`
-              : `🚀 ${count} new commit${count > 1 ? 's' : ''} on ${branch}: ${firstLine(head.message)}`;
-
-            const summary = pr
-              ? `*${esc(pr.user.login)}*'s PR <${pr.html_url}|#${pr.number}> (\`${esc(pr.head.ref)}\` → \`${esc(branch)}\`) was merged by *${esc(payload.pusher.name)}*.`
-              : `*${esc(payload.pusher.name)}* pushed ${count} commit${count > 1 ? 's' : ''} to \`${esc(branch)}\`.`;
-            const stats = `${count} commit${count > 1 ? 's' : ''} · ${files} file${files === 1 ? '' : 's'} changed · +${additions} / −${deletions}`;
-
-            const linkUrl = count > 1 && payload.compare ? payload.compare : head.url;
-            const linkLabel = count > 1 ? 'View all changes' : 'View commit';
+            const heading = `✅ [${product}] PR #${pr.number} merged into ${base}: ${pr.title}`;
+            const description = pr.body ? clip(esc(pr.body.trim()), 500) : '_No description provided._';
+            const stats = `${plural(pr.commits, 'commit')} · ${plural(pr.changed_files, 'file')} changed · +${pr.additions} / −${pr.deletions}`;
 
             const blocks = [
               { type: 'header', text: { type: 'plain_text', text: clip(heading, 150), emoji: true } },
-              { type: 'section', text: { type: 'mrkdwn', text: `${summary}\n${stats}` } },
+              {
+                type: 'section',
+                text: { type: 'mrkdwn', text: `*Summary*\n${description}\n\n${stats}` },
+              },
               {
                 type: 'section',
                 fields: [
-                  { type: 'mrkdwn', text: `*Author*\n${esc(head.author.name)}${head.author.username ? ` (@${esc(head.author.username)})` : ''}` },
-                  { type: 'mrkdwn', text: `*Branch*\n<${repoUrl}/tree/${branch}|${esc(branch)}>` },
+                  { type: 'mrkdwn', text: `*PR author*\n${esc(pr.user.login)}` },
+                  { type: 'mrkdwn', text: `*Merged by*\n${esc(pr.merged_by ? pr.merged_by.login : 'unknown')}` },
+                  { type: 'mrkdwn', text: `*Branch*\n\`${esc(pr.head.ref)}\` → \`${esc(base)}\`` },
+                  { type: 'mrkdwn', text: `*Merge commit*\n<${mergeUrl}|${mergeSha.slice(0, 7)}>` },
                 ],
               },
-              { type: 'section', text: { type: 'mrkdwn', text: `*Commit message*\n>${clip(esc(head.message), 1500).replace(/\n/g, '\n>')}` } },
             ];
 
-            // For multi-commit pushes, list up to 5 commits.
+            if (last) {
+              blocks.push({
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: `*Latest commit* by ${esc(last.commit.author.name)}\n>${clip(esc(last.commit.message), 1000).replace(/\n/g, '\n>')}`,
+                },
+              });
+            }
+
+            // List up to 10 commits in the PR, newest first.
             if (commits.length > 1) {
-              const lines = commits.slice(-5).reverse().map(
-                (c) => `• <${c.url}|\`${c.id.slice(0, 7)}\`> ${esc(clip(firstLine(c.message), 80))} — ${esc(c.author.name)}`
+              const lines = commits.slice(-10).reverse().map(
+                (c) => `• <${c.html_url}|\`${c.sha.slice(0, 7)}\`> ${esc(clip(firstLine(c.commit.message), 80))} — ${esc(c.commit.author.name)}`
               );
-              if (commits.length > 5) lines.push(`_…and ${commits.length - 5} more_`);
-              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Commits*\n${lines.join('\n')}` } });
+              if (commits.length > 10) lines.push(`_…and ${commits.length - 10} more_`);
+              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Commits in this PR*\n${lines.join('\n')}` } });
             }
 
             blocks.push({
               type: 'actions',
-              elements: [{ type: 'button', text: { type: 'plain_text', text: linkLabel }, url: linkUrl, style: 'primary' }],
+              elements: [
+                { type: 'button', text: { type: 'plain_text', text: 'View PR' }, url: pr.html_url, style: 'primary' },
+                { type: 'button', text: { type: 'plain_text', text: 'View merge commit' }, url: mergeUrl },
+              ],
             });
             blocks.push({
               type: 'context',
-              elements: [{ type: 'mrkdwn', text: `<${repoUrl}|${owner}/${repo}> · <${head.url}|${head.id.slice(0, 7)}>` }],
+              elements: [{ type: 'mrkdwn', text: `<${repoUrl}|${owner}/${repo}>` }],
             });
 
             const res = await fetch(webhook, {
