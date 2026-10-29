@@ -1,0 +1,119 @@
+name: Slack commit notifications
+
+# Only these two branches notify. Pushes to test-1, test-2, main, etc. are ignored.
+# A merged PR updates the base branch with a push, so PR merges are covered too.
+on:
+  push:
+    branches:
+      - dev-connect
+      - dev-command
+
+jobs:
+  notify:
+    # Skip branch deletions (nothing to report).
+    if: github.event.deleted == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Send Slack notification
+        uses: actions/github-script@v7
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          script: |
+            const webhook = process.env.SLACK_WEBHOOK_URL;
+            if (!webhook) {
+              core.setFailed('SLACK_WEBHOOK_URL repository secret is not set.');
+              return;
+            }
+
+            const { payload } = context;
+            const { owner, repo } = context.repo;
+            const branch = context.ref.replace('refs/heads/', '');
+            const head = payload.head_commit;
+            const commits = payload.commits || [];
+            const repoUrl = payload.repository.html_url;
+
+            // Slack mrkdwn needs &, <, > escaped.
+            const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const firstLine = (s) => String(s || '').split('\n')[0];
+            const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+
+            // Was this push the result of merging a PR into this branch?
+            let pr = null;
+            try {
+              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: head.id });
+              pr = data.find((p) => p.merged_at && p.base.ref === branch) || null;
+            } catch (e) {
+              core.warning(`PR lookup failed: ${e.message}`);
+            }
+
+            // Diff stats for the whole push (or just the head commit for a brand-new branch).
+            let files = 0, additions = 0, deletions = 0;
+            try {
+              if (/^0+$/.test(payload.before)) {
+                const { data } = await github.rest.repos.getCommit({ owner, repo, ref: head.id });
+                files = data.files.length; additions = data.stats.additions; deletions = data.stats.deletions;
+              } else {
+                const { data } = await github.rest.repos.compareCommits({ owner, repo, base: payload.before, head: payload.after });
+                files = data.files.length;
+                for (const f of data.files) { additions += f.additions; deletions += f.deletions; }
+              }
+            } catch (e) {
+              core.warning(`Diff stats lookup failed: ${e.message}`);
+            }
+
+            const count = commits.length || 1;
+            const heading = pr
+              ? `🔀 PR #${pr.number} merged into ${branch}: ${pr.title}`
+              : `🚀 ${count} new commit${count > 1 ? 's' : ''} on ${branch}: ${firstLine(head.message)}`;
+
+            const summary = pr
+              ? `*${esc(pr.user.login)}*'s PR <${pr.html_url}|#${pr.number}> (\`${esc(pr.head.ref)}\` → \`${esc(branch)}\`) was merged by *${esc(payload.pusher.name)}*.`
+              : `*${esc(payload.pusher.name)}* pushed ${count} commit${count > 1 ? 's' : ''} to \`${esc(branch)}\`.`;
+            const stats = `${count} commit${count > 1 ? 's' : ''} · ${files} file${files === 1 ? '' : 's'} changed · +${additions} / −${deletions}`;
+
+            const linkUrl = count > 1 && payload.compare ? payload.compare : head.url;
+            const linkLabel = count > 1 ? 'View all changes' : 'View commit';
+
+            const blocks = [
+              { type: 'header', text: { type: 'plain_text', text: clip(heading, 150), emoji: true } },
+              { type: 'section', text: { type: 'mrkdwn', text: `${summary}\n${stats}` } },
+              {
+                type: 'section',
+                fields: [
+                  { type: 'mrkdwn', text: `*Author*\n${esc(head.author.name)}${head.author.username ? ` (@${esc(head.author.username)})` : ''}` },
+                  { type: 'mrkdwn', text: `*Branch*\n<${repoUrl}/tree/${branch}|${esc(branch)}>` },
+                ],
+              },
+              { type: 'section', text: { type: 'mrkdwn', text: `*Commit message*\n>${clip(esc(head.message), 1500).replace(/\n/g, '\n>')}` } },
+            ];
+
+            // For multi-commit pushes, list up to 5 commits.
+            if (commits.length > 1) {
+              const lines = commits.slice(-5).reverse().map(
+                (c) => `• <${c.url}|\`${c.id.slice(0, 7)}\`> ${esc(clip(firstLine(c.message), 80))} — ${esc(c.author.name)}`
+              );
+              if (commits.length > 5) lines.push(`_…and ${commits.length - 5} more_`);
+              blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*Commits*\n${lines.join('\n')}` } });
+            }
+
+            blocks.push({
+              type: 'actions',
+              elements: [{ type: 'button', text: { type: 'plain_text', text: linkLabel }, url: linkUrl, style: 'primary' }],
+            });
+            blocks.push({
+              type: 'context',
+              elements: [{ type: 'mrkdwn', text: `<${repoUrl}|${owner}/${repo}> · <${head.url}|${head.id.slice(0, 7)}>` }],
+            });
+
+            const res = await fetch(webhook, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: heading, blocks }),
+            });
+            const body = await res.text();
+            if (!res.ok || body !== 'ok') core.setFailed(`Slack returned ${res.status}: ${body}`);
+            else core.info('Slack notification sent.');
