@@ -1,12 +1,12 @@
 name: Slack PR merge notifications
 
-# Notify only when a PR is MERGED into dev-connect or dev-command.
+# Notify only when a PR is MERGED into dev-connect-wp or dev-command.
 # Individual commits/pushes, other branches, and PRs closed without merging are ignored.
 on:
   pull_request:
     types: [closed]
     branches:
-      - dev-connect
+      - dev-connect-wp
       - dev-command
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
             const { owner, repo } = context.repo;
             const base = pr.base.ref;
             const repoUrl = context.payload.repository.html_url;
-            const product = { 'dev-connect': 'WordPress plugin', 'dev-command': 'Claude plugin' }[base] || base;
+            const product = { 'dev-connect-wp': 'WordPress plugin', 'dev-command': 'Claude plugin' }[base] || base;
 
             // Slack mrkdwn needs &, <, > escaped.
             const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -46,6 +46,17 @@ jobs:
               commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 });
             } catch (e) {
               core.warning(`Commit lookup failed: ${e.message}`);
+            }
+
+            // Reviewers whose latest decision on the PR is "approved".
+            let approvers = [];
+            try {
+              const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number: pr.number, per_page: 100 });
+              const latest = {};
+              for (const r of reviews) if (r.user && r.state !== 'COMMENTED') latest[r.user.login] = r.state;
+              approvers = Object.keys(latest).filter((u) => latest[u] === 'APPROVED');
+            } catch (e) {
+              core.warning(`Review lookup failed: ${e.message}`);
             }
 
             const mergeSha = pr.merge_commit_sha;
@@ -66,6 +77,7 @@ jobs:
                 type: 'section',
                 fields: [
                   { type: 'mrkdwn', text: `*PR author*\n${esc(pr.user.login)}` },
+                  { type: 'mrkdwn', text: `*Approved by*\n${approvers.length ? esc(approvers.join(', ')) : '_No GitHub approval_'}` },
                   { type: 'mrkdwn', text: `*Merged by*\n${esc(pr.merged_by ? pr.merged_by.login : 'unknown')}` },
                   { type: 'mrkdwn', text: `*Branch*\n\`${esc(pr.head.ref)}\` → \`${esc(base)}\`` },
                   { type: 'mrkdwn', text: `*Merge commit*\n<${mergeUrl}|${mergeSha.slice(0, 7)}>` },
